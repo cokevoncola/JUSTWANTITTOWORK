@@ -1,153 +1,94 @@
 # src/build_team_batting_profiles.py
-# -*- coding: utf-8 -*-
+"""
+Utility to validate and prepare team batting reference tables.
+
+- Reads three CSVs placed in models/: season backbone + vs LHP + vs RHP (as-is).
+- Converts Fangraphs percentage columns to decimals where present.
+- Writes a compact preview CSV for sanity checks (models/team_batting_preview.csv).
+- Does NOT merge into a giant table; simulator uses runtime lookups via src.fallbacks.
+"""
 
 from __future__ import annotations
-import re
+import argparse
 from pathlib import Path
-import numpy as np
 import pandas as pd
 
-OUT_PATH = Path("models/team_batting_profiles.parquet")
+DEFAULT_MODELS_DIR = Path("models")
+SEASON_CSV = DEFAULT_MODELS_DIR / "2025_team_batter_stats.csv"
+LHP_CSV    = DEFAULT_MODELS_DIR / "2025_team_batting_vs_LHP.csv"
+RHP_CSV    = DEFAULT_MODELS_DIR / "2025_team_batting_vs_RHP.csv"
+PREVIEW_OUT = DEFAULT_MODELS_DIR / "team_batting_preview.csv"
 
-# ---------- naming helpers ----------
-REPLACERS = {
-    "%": "pct",
-    "/": "_",
-    "-": "_",
-    " ": "_",
-}
+def _load_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if "team" not in df.columns:
+        for c in ("Team", "Tm", "club"):
+            if c in df.columns:
+                df = df.rename(columns={c: "team"})
+                break
+    if "year" not in df.columns:
+        if "Season" in df.columns:
+            df = df.rename(columns={"Season": "year"})
+        else:
+            df["year"] = 2025
+    df["team"] = df["team"].astype(str).str.upper().str.strip()
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").fillna(2025).astype(int)
+    return df
 
-CANON_RENAMES = {
-    # core counting columns
-    "so": "so", "bb": "bb", "pa": "pa", "ab": "ab", "h": "h",
-    # slash line
-    "ba": "ba", "obp": "obp", "slg": "slg",
-    # quality of contact + plate discipline (we keep these)
-    "woba": "woba", "wobacon": "wobacon",
-    "xwoba": "xwoba", "xwobacon": "xwobacon",
-    "xba": "xba", "xslg": "xslg",
-    "zone_pct": "zone_pct",
-    "zone_swing_pct": "zone_swing_pct",
-    "zone_contact_pct": "zone_contact_pct",
-    "chase_pct": "chase_pct",
-    "chase_contact_pct": "chase_contact_pct",
-    "whiff_pct": "whiff_pct",
-    "swing_pct": "swing_pct",
-    "meatball_pct": "meatball_pct",
-    "meatball_swing_pct": "meatball_swing_pct",
-    "gb_pct": "gb_pct", "fb_pct": "fb_pct", "ld_pct": "ld_pct", "pu_pct": "pu_pct",
-    "pull_pct": "pull_pct", "straight_pct": "straight_pct", "oppo_pct": "oppo_pct",
-    "weak_pct": "weak_pct", "topped_pct": "topped_pct", "under_pct": "under_pct",
-    "solid_pct": "solid_pct",
-    # barrels etc (note: some exports have "barrell_pct" misspelled)
-    "barrels": "barrels",
-    "barrel_pct": "barrel_pct",
-    "barrell_pct": "barrel_pct",
-    # misc EV / LA
-    "exit_velocity": "exit_velocity",
-    "launch_angle": "launch_angle",
-    "launch_angle_sweet_spot_pct": "sweet_spot_pct",
-    "flare_burner_pct": "flare_burner_pct",
-    "pitches": "pitches",
-    "batted_balls": "batted_balls",
-    "bbe": "bbe",
-    # meta
-    "team": "team",
-    "year": "year",
-    "1st_pitch_swing_pct": "first_pitch_swing_pct",
-}
+def _pct_to_dec(df: pd.DataFrame, cols):
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce") / 100.0
 
-def to_snake(c: str) -> str:
-    c = c.strip()
-    for k, v in REPLACERS.items():
-        c = c.replace(k, v)
-    c = re.sub(r"__+", "_", c)
-    c = re.sub(r"[^0-9a-zA-Z_]+", "_", c)
-    c = c.lower().strip("_")
-    # special cases to harmonize
-    c = c.replace("launch_angle_sweet_spot_pct", "launch_angle_sweet_spot_pct")
-    c = c.replace("flare_burner_pct", "flare_burner_pct")
-    return CANON_RENAMES.get(c, c)
+def export_preview(season: pd.DataFrame, lhp: pd.DataFrame, rhp: pd.DataFrame, out_path: Path) -> None:
+    base_keep = [c for c in ["team","year","pa","bb","so","hr","ba","obp","slg","woba"] if c in season.columns]
+    base = season[base_keep] if base_keep else season[["team","year"]].copy()
 
-# ---------- empirical bayes ----------
-def eb_shrink(p_hat, n, prior, lam):
-    p_hat = pd.Series(p_hat, dtype="float64")
-    n = pd.Series(n, dtype="float64")
-    prior = prior if isinstance(prior, pd.Series) else pd.Series(prior, index=p_hat.index, dtype="float64")
-    w = n / (n + float(lam))
-    return w * p_hat + (1.0 - w) * prior
+    def pick(df, cols):
+        cols = [c for c in cols if c in df.columns]
+        return df[["team","year"] + cols] if cols else df[["team","year"]]
 
-def add_rate(df: pd.DataFrame, num: str, den: str, out: str) -> None:
-    df[out] = np.where(df[den].fillna(0) > 0, df[num] / df[den], np.nan)
+    l_cols = ["PA","BB","SO","HR","K%","BB%"]
+    r_cols = ["PA","BB","SO","HR","K%","BB%"]
 
-def build_team_batting(in_path: str, out_path: Path = OUT_PATH, use_eb: bool = True, lam: float = 600.0) -> pd.DataFrame:
-    # read CSV or parquet
-    p = Path(in_path)
-    if not p.exists():
-        raise FileNotFoundError(in_path)
-    if p.suffix.lower() == ".csv":
-        raw = pd.read_csv(p)
-    else:
-        raw = pd.read_parquet(p)
+    lhp_small = pick(lhp, l_cols).rename(columns={
+        "PA":"pa_vs_lhp","BB":"bb_vs_lhp","SO":"so_vs_lhp","HR":"hr_vs_lhp","K%":"k_rate_vs_lhp","BB%":"bb_rate_vs_lhp"
+    })
+    rhp_small = pick(rhp, r_cols).rename(columns={
+        "PA":"pa_vs_rhp","BB":"bb_vs_rhp","SO":"so_vs_rhp","HR":"hr_vs_rhp","K%":"k_rate_vs_rhp","BB%":"bb_rate_vs_rhp"
+    })
 
-    # rename columns to snake_case and canonical names
-    raw = raw.rename(columns={c: to_snake(c) for c in raw.columns})
+    preview = base.merge(lhp_small, on=["team","year"], how="left").merge(rhp_small, on=["team","year"], how="left")
+    preview.to_csv(out_path, index=False)
 
-    # make sure required columns exist (we’ll tolerate extra ones)
-    required = ["team", "year", "pa", "bb", "so"]
-    for r in required:
-        if r not in raw.columns:
-            raw[r] = np.nan
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--models_dir", type=str, default=str(DEFAULT_MODELS_DIR), help="Directory containing the team CSVs.")
+    args = parser.parse_args()
 
-    df = raw.copy()
+    models_dir = Path(args.models_dir)
+    season = _load_csv(models_dir / SEASON_CSV.name)
+    lhp    = _load_csv(models_dir / LHP_CSV.name)
+    rhp    = _load_csv(models_dir / RHP_CSV.name)
 
-    # derive core rates
-    add_rate(df, "so", "pa", "k_rate")
-    add_rate(df, "bb", "pa", "bb_rate")
+    # Convert Fangraphs percentage columns to decimals
+    _pct_to_dec(lhp, ["BB%", "K%", "LD%", "GB%", "FB%", "Pull%", "Oppo%"])
+    _pct_to_dec(rhp, ["BB%", "K%", "LD%", "GB%", "FB%", "Pull%", "Oppo%"])
 
-    # if you prefer everything as rate (0..1) not %, keep as-is
-    # optional EB smoothing for k_rate/bb_rate by team using team PA as n
-    if use_eb:
-        # league priors (simple mean across teams for that year)
-        dfg = df.groupby("year", dropna=False)
-        league_k = dfg["k_rate"].transform("mean")
-        league_bb = dfg["bb_rate"].transform("mean")
+    # Basic validations
+    print(f"Loaded season rows: {len(season)} | cols: {len(season.columns)}")
+    print(f"Loaded vs LHP rows: {len(lhp)} | cols: {len(lhp.columns)}")
+    print(f"Loaded vs RHP rows: {len(rhp)} | cols: {len(rhp.columns)}")
+    missing = []
+    for team in season["team"].unique():
+        if not ((lhp["team"] == team).any() and (rhp["team"] == team).any()):
+            missing.append(team)
+    if missing:
+        print("⚠️ Teams missing in split files:", ", ".join(sorted(set(missing))))
 
-        df["k_rate_eb"] = eb_shrink(df["k_rate"], df["pa"], league_k, lam)
-        df["bb_rate_eb"] = eb_shrink(df["bb_rate"], df["pa"], league_bb, lam)
-    else:
-        df["k_rate_eb"] = df["k_rate"]
-        df["bb_rate_eb"] = df["bb_rate"]
-
-    # keep a compact set your sim/fallback needs (you can keep more)
-    keep_cols = [
-        "team", "year",
-        "pa", "bb", "so",
-        "k_rate", "k_rate_eb", "bb_rate", "bb_rate_eb",
-        "zone_pct", "zone_swing_pct", "zone_contact_pct",
-        "chase_pct", "chase_contact_pct",
-        "whiff_pct", "swing_pct",
-        "woba", "xwoba", "xba", "xslg",
-        "gb_pct", "fb_pct", "ld_pct", "pu_pct",
-        "pull_pct", "straight_pct", "oppo_pct",
-        "barrel_pct", "sweet_spot_pct", "solid_pct", "flare_burner_pct",
-    ]
-    keep_cols = [c for c in keep_cols if c in df.columns]
-    out = df[keep_cols].copy()
-
-    # index by team for fast lookup later
-    out = out.sort_values(["year", "team"]).reset_index(drop=True)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(out_path, index=False)
-    print(f"✅ wrote {out_path} with {len(out)} rows and {len(out.columns)} cols")
-    return out
+    models_dir.mkdir(parents=True, exist_ok=True)
+    export_preview(season, lhp, rhp, models_dir / PREVIEW_OUT.name)
+    print(f"Preview saved to {models_dir / PREVIEW_OUT.name}")
 
 if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--in", dest="in_path", required=True, help="CSV or parquet of team season batting")
-    ap.add_argument("--out", dest="out_path", default=str(OUT_PATH))
-    ap.add_argument("--no-eb", dest="use_eb", action="store_false", help="disable EB smoothing")
-    ap.add_argument("--lam", dest="lam", type=float, default=600.0, help="EB prior strength (team PA pseudo-counts)")
-    args = ap.parse_args()
-    build_team_batting(args.in_path, Path(args.out_path), use_eb=args.use_eb, lam=args.lam)
+    main()
