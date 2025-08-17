@@ -1,17 +1,30 @@
 # src/fallbacks.py
+"""
+Team-aware fallback helpers for batter rates.
+
+We keep your CSVs exactly as-is in `models/`:
+  - models/2025_team_batter_stats.csv          (season backbone; e.g., pa, bb, so, woba, etc.)
+  - models/2025_team_batting_vs_LHP.csv        (Fangraphs vs LHP splits; includes K%, BB% columns)
+  - models/2025_team_batting_vs_RHP.csv        (Fangraphs vs RHP splits; includes K%, BB% columns)
+
+Functions:
+  - load_team_tables()                    -> dict with DataFrames (season/lhp/rhp), indexed by (team, year)
+  - resolve_batter_rate_with_fallback()   -> per-batter rate resolution using player-first -> team split -> team season
+"""
+
 from __future__ import annotations
 import pandas as pd
-import numpy as np
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 
+# Keep your CSVs exactly as-is; no renaming required.
 SEASON_CSV = Path("models/2025_team_batter_stats.csv")
 LHP_CSV    = Path("models/2025_team_batting_vs_LHP.csv")
 RHP_CSV    = Path("models/2025_team_batting_vs_RHP.csv")
 
 def _load_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
-    # Map team/year without renaming your files
+    # Normalize team/year columns if needed
     if "team" not in df.columns:
         for c in ("Team", "Tm", "club"):
             if c in df.columns:
@@ -27,16 +40,23 @@ def _load_csv(path: Path) -> pd.DataFrame:
     return df
 
 def _pct_to_dec(df: pd.DataFrame, cols):
+    """Convert % columns (e.g., Fangraphs 'K%') to decimals (0-1)."""
     for c in cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce") / 100.0
 
 def load_team_tables() -> Dict[str, pd.DataFrame]:
+    """
+    Returns dict with:
+      - season: Statcast-style season backbone (indexed by team,year)
+      - lhp: Fangraphs vs LHP splits (K%, BB% converted to decimals)
+      - rhp: Fangraphs vs RHP splits (K%, BB% converted to decimals)
+    """
     season = _load_csv(SEASON_CSV)
     lhp    = _load_csv(LHP_CSV)
     rhp    = _load_csv(RHP_CSV)
 
-    # Convert Fangraphs % to decimals
+    # Convert Fangraphs % to decimals if present
     _pct_to_dec(lhp, ["BB%", "K%", "LD%", "GB%", "FB%", "Pull%", "Oppo%"])
     _pct_to_dec(rhp, ["BB%", "K%", "LD%", "GB%", "FB%", "Pull%", "Oppo%"])
 
@@ -47,15 +67,16 @@ def load_team_tables() -> Dict[str, pd.DataFrame]:
 
     return {"season": season, "lhp": lhp, "rhp": rhp}
 
-# --- Team rate helpers ---
-
 def team_rate(
     tables: Dict[str,pd.DataFrame], team: str, year: int,
     stat: str, split: Optional[str]
 ) -> Optional[float]:
     """
-    stat in {'k_rate','bb_rate'} for now.
+    Compute team-level rate for stat in {'k_rate','bb_rate'}.
     split: None | 'vs_lhp' | 'vs_rhp'
+
+    Uses Fangraphs split K%/BB% when available; otherwise falls back to counts/PA.
+    Falls back to season backbone for no-split case (expects 'so','bb','pa' columns).
     """
     team = str(team).upper().strip()
     idx = (team, int(year))
@@ -64,19 +85,19 @@ def team_rate(
 
     if split in ("vs_lhp", "vs_rhp"):
         df = lhp if split == "vs_lhp" else rhp
-        # Prefer % columns if present
         pct_col = {"k_rate": "K%", "bb_rate": "BB%"}[stat]
         if pct_col in df.columns and idx in df.index:
             val = df.at[idx, pct_col]
             return None if pd.isna(val) else float(val)
-        # Fallback to counts / PA
+
+        # fallback using counts
         num_col = {"k_rate": "SO", "bb_rate": "BB"}[stat]
         if {"PA", num_col}.issubset(df.columns) and idx in df.index:
             pa = float(df.at[idx, "PA"])
             if pa > 0:
                 return float(df.at[idx, num_col]) / pa
 
-    # Season backbone (Statcast style)
+    # Season backbone (Statcast-style)
     if stat == "k_rate" and {"so","pa"}.issubset(season.columns) and idx in season.index:
         pa = float(season.at[idx, "pa"])
         return float(season.at[idx, "so"]) / pa if pa > 0 else None
@@ -91,8 +112,8 @@ def resolve_batter_rate_with_fallback(
     team: str, year: int, stat: str, pitcher_hand: str
 ) -> Optional[float]:
     """
-    Player-first:
-      1) player split (e.g. batter['k_rate_vs_LHP'])
+    Player-first resolution:
+      1) player split (e.g. batter['k_rate_vs_LHP'] if pitcher throws L)
       2) player season (e.g. batter['k_rate'])
       3) team split (preferred vs pitcher hand)
       4) team season
@@ -119,3 +140,4 @@ def resolve_batter_rate_with_fallback(
     # 4) team season
     v = team_rate(tables, team, year, stat=stat, split=None)
     return None if v is None else float(v)
+
